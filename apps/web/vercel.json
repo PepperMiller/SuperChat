@@ -1,5 +1,5 @@
 {
   "framework": "nextjs",
   "installCommand": "pnpm install",
-  "buildCommand": "pnpm --filter @superchat/shared build && cd apps/web && next build"
+  "buildCommand": "pnpm --filter @superchat/shared build && next build"
 }
