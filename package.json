@@ -1,0 +1,22 @@
+{
+  "name": "superchat",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"pnpm --filter @superchat/server dev\" \"pnpm --filter @superchat/web dev\"",
+    "build": "pnpm --filter @superchat/shared build && pnpm --filter @superchat/server build && pnpm --filter @superchat/web build",
+    "db:generate": "pnpm --filter @superchat/server db:generate",
+    "db:migrate": "pnpm --filter @superchat/server db:migrate",
+    "db:push": "pnpm --filter @superchat/server db:push"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "unrs-resolver"
+    ]
+  }
+}
