@@ -6,11 +6,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { Send, Mic, MicOff, Square } from "lucide-react";
-import { useApp } from "@/lib/context";
-import { getMessages, getBot, getConversation } from "@/lib/api";
+import { Send, Mic, MicOff } from "lucide-react";
+import { getMessages, getBot, getConversation, sendChatMessage } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { WSServerMessage } from "@superchat/shared";
 import { VoiceOverlay } from "./VoiceOverlay";
 
 interface MessageItem {
@@ -33,7 +31,6 @@ interface BotInfo {
 }
 
 export function ChatView({ conversationId }: { conversationId: string }) {
-  const { wsSend, wsSubscribe } = useApp();
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -41,7 +38,7 @@ export function ChatView({ conversationId }: { conversationId: string }) {
   const [bot, setBot] = useState<BotInfo | null>(null);
   const [voiceMode, setVoiceMode] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Load messages and bot info
   useEffect(() => {
@@ -55,42 +52,24 @@ export function ChatView({ conversationId }: { conversationId: string }) {
     });
   }, [conversationId]);
 
-  // Subscribe to WS messages
-  useEffect(() => {
-    return wsSubscribe((msg: WSServerMessage) => {
-      if (msg.type === "chat:response" && msg.conversationId === conversationId) {
-        if (msg.done) {
-          setStreaming(false);
-          setStreamingContent("");
-          // Reload messages to get the saved version
-          getMessages(conversationId).then((msgs) =>
-            setMessages(msgs as unknown as MessageItem[])
-          );
-        } else {
-          setStreamingContent((prev) => prev + msg.delta);
-        }
-      }
-      if (msg.type === "chat:error" && msg.conversationId === conversationId) {
-        setStreaming(false);
-        setStreamingContent("");
-      }
-      if (
-        msg.type === "voice:transcription" &&
-        msg.conversationId === conversationId &&
-        msg.isFinal
-      ) {
-        // Reload messages when a voice transcription is final
-        getMessages(conversationId).then((msgs) =>
-          setMessages(msgs as unknown as MessageItem[])
-        );
-      }
-    });
-  }, [conversationId, wsSubscribe]);
-
   // Auto-scroll
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingContent]);
+
+  // Cleanup abort on unmount
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  // Reload messages (used after voice sessions end)
+  const reloadMessages = useCallback(() => {
+    getMessages(conversationId).then((msgs) =>
+      setMessages(msgs as unknown as MessageItem[])
+    );
+  }, [conversationId]);
 
   const sendMessage = useCallback(() => {
     const content = input.trim();
@@ -112,12 +91,21 @@ export function ChatView({ conversationId }: { conversationId: string }) {
     setStreaming(true);
     setStreamingContent("");
 
-    wsSend({
-      type: "chat:message",
-      conversationId,
-      content,
+    abortRef.current = sendChatMessage(conversationId, content, {
+      onDelta(delta) {
+        setStreamingContent((prev) => prev + delta);
+      },
+      onDone() {
+        setStreaming(false);
+        setStreamingContent("");
+        reloadMessages();
+      },
+      onError() {
+        setStreaming(false);
+        setStreamingContent("");
+      },
     });
-  }, [input, streaming, conversationId, wsSend]);
+  }, [input, streaming, conversationId, reloadMessages]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -226,7 +214,10 @@ export function ChatView({ conversationId }: { conversationId: string }) {
         <VoiceOverlay
           conversationId={conversationId}
           bot={bot}
-          onClose={() => setVoiceMode(false)}
+          onClose={() => {
+            setVoiceMode(false);
+            reloadMessages();
+          }}
         />
       )}
 
@@ -235,7 +226,6 @@ export function ChatView({ conversationId }: { conversationId: string }) {
         <div className="border-t px-4 py-3 md:px-6">
           <div className="flex gap-2 max-w-3xl mx-auto">
             <Textarea
-              ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}

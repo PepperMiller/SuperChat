@@ -15,21 +15,19 @@
     "@anthropic-ai/sdk": "^0.39.0",
     "@google/generative-ai": "^0.24.0",
     "@superchat/shared": "workspace:*",
-    "postgres": "^3.4.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.38.4",
     "express": "^4.21.2",
     "openai": "^4.82.0",
-    "uuid": "^11.1.0",
-    "ws": "^8.18.0"
+    "postgres": "^3.4.5",
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/express-serve-static-core": "^5.1.1",
     "@types/uuid": "^10.0.0",
-    "@types/ws": "^8.5.13",
     "drizzle-kit": "^0.30.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"

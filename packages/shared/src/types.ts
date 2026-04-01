@@ -21,7 +21,6 @@ export interface ApiKey {
   userId: string;
   provider: ApiKeyProvider;
   createdAt: Date;
-  // encrypted_key never sent to client
 }
 
 export interface Bot {
@@ -58,7 +57,7 @@ export interface Message {
   createdAt: Date;
 }
 
-// ── API request/response types ──
+// ── API request types ──
 
 export interface CreateBotRequest {
   name: string;
@@ -78,77 +77,52 @@ export interface CreateConversationRequest {
   title?: string;
 }
 
-export interface SendMessageRequest {
-  content: string;
-  inputMode?: InputMode;
-}
-
 export interface SetApiKeyRequest {
   provider: ApiKeyProvider;
   key: string;
 }
 
-// ── WebSocket event types ──
+// ── SSE chat types ──
 
-export interface WSChatMessage {
-  type: "chat:message";
+export interface SSEChatDelta {
+  delta: string;
+  done: false;
+}
+
+export interface SSEChatDone {
+  done: true;
+  messageId: string;
+}
+
+export interface SSEChatError {
+  error: string;
+  done: true;
+}
+
+export type SSEChatEvent = SSEChatDelta | SSEChatDone | SSEChatError;
+
+// ── REST request types ──
+
+export interface SendChatRequest {
   conversationId: string;
   content: string;
 }
 
-export interface WSChatResponse {
-  type: "chat:response";
+export interface SaveTranscriptRequest {
   conversationId: string;
-  messageId: string;
-  delta: string;
-  done: boolean;
+  messages: Array<{
+    role: MessageRole;
+    content: string;
+    inputMode: InputMode;
+  }>;
 }
 
-export interface WSChatError {
-  type: "chat:error";
-  conversationId: string;
-  error: string;
-}
-
-export interface WSVoiceStart {
-  type: "voice:start";
-  conversationId: string;
-}
-
-export interface WSVoiceAudio {
-  type: "voice:audio";
-  conversationId: string;
+export interface TranscribeRequest {
   audio: string; // base64
+  conversationId: string;
 }
 
-export interface WSVoiceTranscription {
-  type: "voice:transcription";
-  conversationId: string;
-  role: "user" | "assistant";
+export interface SynthesizeRequest {
   text: string;
-  isFinal: boolean;
-}
-
-export interface WSVoiceResponseAudio {
-  type: "voice:response_audio";
-  conversationId: string;
-  audio: string; // base64
-}
-
-export interface WSVoiceStop {
-  type: "voice:stop";
   conversationId: string;
 }
-
-export type WSClientMessage =
-  | WSChatMessage
-  | WSVoiceStart
-  | WSVoiceAudio
-  | WSVoiceStop;
-
-export type WSServerMessage =
-  | WSChatResponse
-  | WSChatError
-  | WSVoiceTranscription
-  | WSVoiceResponseAudio
-  | WSVoiceStop;

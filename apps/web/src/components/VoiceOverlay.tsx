@@ -3,9 +3,14 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Mic, MicOff, Phone } from "lucide-react";
-import { useApp } from "@/lib/context";
-import { getVoiceToken } from "@/lib/api";
-import type { WSServerMessage } from "@superchat/shared";
+import {
+  getVoiceToken,
+  getGoogleVoiceToken,
+  saveTranscript,
+  transcribeAudio,
+  sendChatMessage,
+  synthesizeSpeech,
+} from "@/lib/api";
 
 interface BotInfo {
   name: string;
@@ -22,6 +27,18 @@ interface TranscriptLine {
   isFinal: boolean;
 }
 
+type VoiceMode = "webrtc" | "gemini-live" | "chained";
+
+function getVoiceMode(bot: BotInfo): VoiceMode {
+  if (bot.modelProvider === "openai" && !bot.sttProvider && !bot.ttsProvider) {
+    return "webrtc";
+  }
+  if (bot.modelProvider === "google" && !bot.sttProvider && !bot.ttsProvider) {
+    return "gemini-live";
+  }
+  return "chained";
+}
+
 export function VoiceOverlay({
   conversationId,
   bot,
@@ -31,25 +48,27 @@ export function VoiceOverlay({
   bot: BotInfo;
   onClose: () => void;
 }) {
-  const { wsSend, wsSubscribe, userId } = useApp();
   const [muted, setMuted] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
-  const [mode, setMode] = useState<"webrtc" | "chained" | null>(null);
+  const [mode, setMode] = useState<VoiceMode | null>(null);
   const [status, setStatus] = useState("Connecting...");
+  const [recording, setRecording] = useState(false);
 
-  // WebRTC refs
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
-
-  // Chained mode refs
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const geminiWsRef = useRef<WebSocket | null>(null);
+  const transcriptRef = useRef<TranscriptLine[]>([]);
 
-  // Determine mode: use WebRTC if bot uses OpenAI model provider and has no explicit STT/TTS
-  const useWebRTC =
-    bot.modelProvider === "openai" && !bot.sttProvider && !bot.ttsProvider;
+  // Keep ref in sync for cleanup
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
 
+  const voiceMode = getVoiceMode(bot);
+
+  // ── OpenAI WebRTC Mode ──
   const startWebRTC = useCallback(async () => {
     setMode("webrtc");
     setStatus("Getting token...");
@@ -71,19 +90,16 @@ export function VoiceOverlay({
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
-      // Set up audio playback
       const audioEl = document.createElement("audio");
       audioEl.autoplay = true;
       pc.ontrack = (e) => {
         audioEl.srcObject = e.streams[0];
       };
 
-      // Add microphone
       const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = ms;
       ms.getTracks().forEach((track) => pc.addTrack(track, ms));
 
-      // Data channel for events
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;
 
@@ -109,16 +125,8 @@ export function VoiceOverlay({
             }
             return prev;
           });
-          // Send transcript to server for storage
-          wsSend({
-            type: "chat:message",
-            conversationId,
-            content: `[voice transcript stored]`,
-          });
         }
-        if (
-          event.type === "conversation.item.input_audio_transcription.completed"
-        ) {
+        if (event.type === "conversation.item.input_audio_transcription.completed") {
           setTranscript((prev) => [
             ...prev,
             { role: "user", text: event.transcript, isFinal: true },
@@ -126,7 +134,6 @@ export function VoiceOverlay({
         }
       };
 
-      // Create offer
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
@@ -150,8 +157,133 @@ export function VoiceOverlay({
       console.error("WebRTC error:", err);
       setStatus("Connection failed");
     }
-  }, [bot, conversationId, wsSend]);
+  }, [bot]);
 
+  // ── Google Gemini Live Mode ──
+  const startGeminiLive = useCallback(async () => {
+    setMode("gemini-live");
+    setStatus("Getting token...");
+
+    try {
+      const tokenData = (await getGoogleVoiceToken(bot.ttsVoiceId || undefined)) as {
+        apiKey?: string;
+        token?: string;
+        model?: string;
+      };
+
+      const apiKey = tokenData.apiKey || tokenData.token;
+      if (!apiKey) {
+        setStatus("Failed to get Google token");
+        return;
+      }
+
+      setStatus("Connecting to Gemini Live...");
+
+      // Connect via WebSocket to Gemini Live API
+      const model = tokenData.model || "gemini-2.5-flash";
+      const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+
+      const ws = new WebSocket(wsUrl);
+      geminiWsRef.current = ws;
+
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = ms;
+
+      ws.onopen = () => {
+        // Send setup message
+        ws.send(JSON.stringify({
+          setup: {
+            model: `models/${model}`,
+            generationConfig: {
+              responseModalities: ["AUDIO", "TEXT"],
+            },
+            systemInstruction: {
+              parts: [{ text: bot.systemPrompt }],
+            },
+          },
+        }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          // Handle setup complete
+          if (data.setupComplete) {
+            setStatus("Connected - speak to chat");
+            startGeminiAudioStream(ws, ms);
+            return;
+          }
+
+          // Handle server content (text transcription of response)
+          if (data.serverContent?.modelTurn?.parts) {
+            for (const part of data.serverContent.modelTurn.parts) {
+              if (part.text) {
+                setTranscript((prev) => {
+                  const last = prev[prev.length - 1];
+                  if (last && last.role === "assistant" && !last.isFinal) {
+                    return [
+                      ...prev.slice(0, -1),
+                      { ...last, text: last.text + part.text },
+                    ];
+                  }
+                  return [...prev, { role: "assistant", text: part.text, isFinal: false }];
+                });
+              }
+            }
+          }
+
+          // Handle turn complete
+          if (data.serverContent?.turnComplete) {
+            setTranscript((prev) => {
+              const last = prev[prev.length - 1];
+              if (last && last.role === "assistant" && !last.isFinal) {
+                return [...prev.slice(0, -1), { ...last, isFinal: true }];
+              }
+              return prev;
+            });
+          }
+        } catch {
+          // skip parse errors
+        }
+      };
+
+      ws.onerror = () => {
+        setStatus("Connection error");
+      };
+
+      ws.onclose = () => {
+        setStatus("Disconnected");
+      };
+    } catch (err) {
+      console.error("Gemini Live error:", err);
+      setStatus("Connection failed");
+    }
+  }, [bot]);
+
+  function startGeminiAudioStream(ws: WebSocket, ms: MediaStream) {
+    const recorder = new MediaRecorder(ms, { mimeType: "audio/webm" });
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = async (e) => {
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+        const buffer = await e.data.arrayBuffer();
+        const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+        ws.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{
+              mimeType: "audio/webm",
+              data: base64,
+            }],
+          },
+        }));
+      }
+    };
+
+    recorder.start(1000);
+  }
+
+  // ── Chained REST Mode (Anthropic / explicit STT+TTS) ──
   const startChained = useCallback(async () => {
     setMode("chained");
     setStatus("Starting microphone...");
@@ -159,102 +291,191 @@ export function VoiceOverlay({
     try {
       const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = ms;
-
-      const recorder = new MediaRecorder(ms, { mimeType: "audio/webm" });
-      mediaRecorderRef.current = recorder;
-
-      wsSend({ type: "voice:start", conversationId });
-
-      recorder.ondataavailable = async (e) => {
-        if (e.data.size > 0) {
-          const buffer = await e.data.arrayBuffer();
-          const base64 = btoa(
-            String.fromCharCode(...new Uint8Array(buffer))
-          );
-          wsSend({
-            type: "voice:audio",
-            conversationId,
-            audio: base64,
-          });
-        }
-      };
-
-      // Record in 3-second chunks
-      recorder.start(3000);
-      setStatus("Listening - speak to chat");
+      setRecording(true);
+      setStatus("Listening - tap stop when done speaking");
     } catch (err) {
       console.error("Microphone error:", err);
       setStatus("Microphone access denied");
     }
-  }, [conversationId, wsSend]);
+  }, []);
 
-  // Subscribe to voice transcription events (chained mode)
-  useEffect(() => {
-    return wsSubscribe((msg: WSServerMessage) => {
-      if (
-        msg.type === "voice:transcription" &&
-        msg.conversationId === conversationId
-      ) {
-        if (msg.isFinal) {
+  // Record and process a single voice exchange (chained mode)
+  const processChainedRecording = useCallback(async () => {
+    if (!streamRef.current) return;
+
+    setRecording(false);
+    setStatus("Recording...");
+
+    // Record a short clip
+    const recorder = new MediaRecorder(streamRef.current, { mimeType: "audio/webm" });
+    const chunks: Blob[] = [];
+
+    return new Promise<void>((resolve) => {
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        if (chunks.length === 0) {
+          setRecording(true);
+          setStatus("Listening - tap stop when done speaking");
+          resolve();
+          return;
+        }
+
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        const buffer = await blob.arrayBuffer();
+        const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+
+        // 1. Transcribe
+        setStatus("Transcribing...");
+        try {
+          const { text } = await transcribeAudio(base64, conversationId);
+          if (!text.trim()) {
+            setRecording(true);
+            setStatus("Listening - tap stop when done speaking");
+            resolve();
+            return;
+          }
+
           setTranscript((prev) => [
             ...prev,
-            { role: msg.role, text: msg.text, isFinal: true },
+            { role: "user", text, isFinal: true },
           ]);
+
+          // 2. Send to LLM via SSE
+          setStatus("Thinking...");
+          let responseText = "";
+
+          await new Promise<void>((resolveChat) => {
+            sendChatMessage(conversationId, text, {
+              onDelta(delta) {
+                responseText += delta;
+                setTranscript((prev) => {
+                  const last = prev[prev.length - 1];
+                  if (last && last.role === "assistant" && !last.isFinal) {
+                    return [
+                      ...prev.slice(0, -1),
+                      { ...last, text: last.text + delta },
+                    ];
+                  }
+                  return [...prev, { role: "assistant", text: delta, isFinal: false }];
+                });
+              },
+              onDone() {
+                setTranscript((prev) => {
+                  const last = prev[prev.length - 1];
+                  if (last && last.role === "assistant") {
+                    return [...prev.slice(0, -1), { ...last, isFinal: true }];
+                  }
+                  return prev;
+                });
+                resolveChat();
+              },
+              onError(err) {
+                console.error("Chat error:", err);
+                resolveChat();
+              },
+            });
+          });
+
+          // 3. TTS
+          if (responseText) {
+            setStatus("Speaking...");
+            try {
+              const audioBlob = await synthesizeSpeech(responseText, conversationId);
+              const url = URL.createObjectURL(audioBlob);
+              const audio = new Audio(url);
+              audio.play();
+              audio.onended = () => URL.revokeObjectURL(url);
+            } catch {
+              // TTS failed, continue anyway
+            }
+          }
+        } catch (err) {
+          console.error("Voice processing error:", err);
         }
-      }
-      if (
-        msg.type === "voice:response_audio" &&
-        msg.conversationId === conversationId
-      ) {
-        // Play audio
-        const audioData = atob(msg.audio);
-        const bytes = new Uint8Array(audioData.length);
-        for (let i = 0; i < audioData.length; i++) {
-          bytes[i] = audioData.charCodeAt(i);
+
+        setRecording(true);
+        setStatus("Listening - tap stop when done speaking");
+        resolve();
+      };
+
+      // Record for up to 10 seconds
+      recorder.start();
+      setTimeout(() => {
+        if (recorder.state === "recording") {
+          recorder.stop();
         }
-        const blob = new Blob([bytes], { type: "audio/mp3" });
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        audio.play();
-        audio.onended = () => URL.revokeObjectURL(url);
-      }
+      }, 10000);
+
+      // Store ref so user can stop early
+      mediaRecorderRef.current = recorder;
     });
-  }, [conversationId, wsSubscribe]);
+  }, [conversationId]);
 
   // Start voice on mount
   useEffect(() => {
-    if (useWebRTC) {
+    if (voiceMode === "webrtc") {
       startWebRTC();
+    } else if (voiceMode === "gemini-live") {
+      startGeminiLive();
     } else {
       startChained();
     }
 
     return () => {
-      // Cleanup
       pcRef.current?.close();
       dcRef.current?.close();
       mediaRecorderRef.current?.stop();
       streamRef.current?.getTracks().forEach((t) => t.stop());
-      audioContextRef.current?.close();
+      geminiWsRef.current?.close();
     };
-  }, [useWebRTC, startWebRTC, startChained]);
+  }, [voiceMode, startWebRTC, startGeminiLive, startChained]);
 
   const toggleMute = () => {
     if (streamRef.current) {
       streamRef.current.getAudioTracks().forEach((t) => {
-        t.enabled = muted; // toggle
+        t.enabled = muted;
       });
     }
     setMuted(!muted);
   };
 
-  const handleEnd = () => {
+  const handleStopRecording = () => {
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const handleEnd = async () => {
+    // Save transcript to DB for WebRTC and Gemini Live modes
+    const finalTranscript = transcriptRef.current.filter((t) => t.isFinal);
+    if (finalTranscript.length > 0 && (mode === "webrtc" || mode === "gemini-live")) {
+      try {
+        await saveTranscript(
+          conversationId,
+          finalTranscript.map((t) => ({
+            role: t.role,
+            content: t.text,
+            inputMode: "voice",
+          }))
+        );
+      } catch (err) {
+        console.error("Failed to save transcript:", err);
+      }
+    }
+
     pcRef.current?.close();
+    dcRef.current?.close();
     mediaRecorderRef.current?.stop();
     streamRef.current?.getTracks().forEach((t) => t.stop());
-    wsSend({ type: "voice:stop", conversationId });
+    geminiWsRef.current?.close();
     onClose();
   };
+
+  const modeLabel =
+    mode === "webrtc" ? "WebRTC" : mode === "gemini-live" ? "Gemini Live" : "Chained";
 
   return (
     <div className="absolute inset-0 z-30 flex flex-col bg-background/95 backdrop-blur">
@@ -263,9 +484,7 @@ export function VoiceOverlay({
         <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse" />
         <span className="text-sm text-muted-foreground">{status}</span>
         {mode && (
-          <span className="text-xs text-muted-foreground">
-            ({mode === "webrtc" ? "WebRTC" : "Chained"})
-          </span>
+          <span className="text-xs text-muted-foreground">({modeLabel})</span>
         )}
       </div>
 
@@ -301,6 +520,19 @@ export function VoiceOverlay({
         >
           {muted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
         </Button>
+
+        {/* Chained mode: record/stop button */}
+        {mode === "chained" && recording && (
+          <Button
+            variant="secondary"
+            size="icon"
+            className="h-12 w-12 rounded-full"
+            onClick={processChainedRecording}
+          >
+            <div className="h-4 w-4 rounded-sm bg-red-500" />
+          </Button>
+        )}
+
         <Button
           variant="destructive"
           size="icon"
